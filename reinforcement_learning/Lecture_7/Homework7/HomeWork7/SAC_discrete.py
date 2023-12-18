@@ -1,0 +1,161 @@
+import gym
+import numpy as np
+import torch
+import torch.nn as nn
+from copy import deepcopy
+import random
+from collections import deque
+
+
+class SAC_discrete(nn.Module):
+    """
+    Алгоритм Soft Actor Critic
+
+    Переменные:
+    - self.env - среда
+    - self.n_episode - количество итераций обучения
+    - self.epoch_n - количество шагов в обучении агента
+    - self.batch_size - размер выборки для обучения
+    - self.gamma - коэффициент дисконтирования
+    - self.epsilon - коэффициент ограничивающий частное прогнозов новой и старой политики
+    - self.mean_total_rewards - сохранение наград для графиков
+    - self.n_env_trajectory - количество обращений к среде (траекторий)
+    - self.n_neurons - количество нейронов
+    - self.pi_model - нейросеть политики
+    - self.v_model - нейросеть прогноза ценности состояния
+    - self.pi_lrб self.v_lr - шаги обучения
+    - self.pi_optimizer, self.v_optimizer - оптимизаторы
+
+    Функции:
+     - self.fit - запуск процесса обучения
+     - self.policy_improvement - обучение агента
+     - get_action - получение действия
+    """
+
+    def __init__(self, env, max_len_trajectory=200, n_episode=50, n_neurons=128, gamma=0.99,
+                 batch_size=64, alpha=1e-3, tau=1e-2, q_lr=1e-3, pi_lr=0.001, is_print=True, temperature=10.):
+        super().__init__()
+        self.env = env
+        self.n_episode = n_episode
+        self.batch_size = batch_size
+        self.gamma = gamma
+        self.alpha = alpha
+        self.tau = tau
+        self.temperature = temperature
+        self.memory = deque(maxlen=100000)
+        self.mean_total_rewards = []
+        self.n_actions = env.action_space.n
+        self.n_states = env.observation_space.shape[0]
+
+        self.pi_model = nn.Sequential(nn.Linear(self.n_states, n_neurons), nn.ReLU(),
+                                      nn.Linear(n_neurons, n_neurons), nn.ReLU(),
+                                      nn.Linear(n_neurons, self.n_actions))
+
+        self.q1_model = nn.Sequential(nn.Linear(self.n_states + self.n_actions, n_neurons), nn.ReLU(),
+                                      nn.Linear(n_neurons, n_neurons), nn.ReLU(),
+                                      nn.Linear(n_neurons, 1))
+
+        self.q2_model = nn.Sequential(nn.Linear(self.n_states + self.n_actions, n_neurons), nn.ReLU(),
+                                      nn.Linear(n_neurons, n_neurons), nn.ReLU(),
+                                      nn.Linear(n_neurons, 1))
+
+        self.pi_optimizer = torch.optim.Adam(self.pi_model.parameters(), pi_lr)
+        self.q1_optimizer = torch.optim.Adam(self.q1_model.parameters(), q_lr)
+        self.q2_optimizer = torch.optim.Adam(self.q2_model.parameters(), q_lr)
+        self.q1_target_model = deepcopy(self.q1_model)
+        self.q2_target_model = deepcopy(self.q2_model)
+
+        self.max_len_trajectory = max_len_trajectory
+        self.is_print = is_print
+        self.mean_pi_losses = []
+        self.mean_v_losses = []
+
+    def predict_actions(self, states):
+        probs = torch.nn.functional.softmax(self.pi_model(torch.FloatTensor(states)), dim=-1)
+        dist = torch.distributions.RelaxedOneHotCategorical(torch.FloatTensor([self.temperature]), probs)
+        actions = dist.rsample()
+        log_probs = dist.log_prob(actions)
+        return actions, log_probs
+
+    def get_action(self, state):
+        state = torch.FloatTensor(state).unsqueeze(0)
+        probs = torch.nn.functional.gumbel_softmax(self.pi_model(torch.FloatTensor(state)), tau=0.9, dim=-1)
+        dist = torch.distributions.Categorical(probs)
+        action = dist.sample()
+        return action.detach().numpy()[0]
+
+    def policy_improvement(self, state, action, reward, done, next_state):
+        self.memory.append([state, action, reward, done, next_state])
+        if len(self.memory) > self.batch_size:
+            batch = random.sample(self.memory, self.batch_size)
+            states, actions, rewards, dones, next_states = map(torch.FloatTensor, zip(*batch))
+            rewards, dones = rewards.unsqueeze(1), dones.unsqueeze(1)
+
+            next_actions, next_log_probs = self.predict_actions(next_states)
+            next_states_and_actions = torch.concatenate((next_states, next_actions), dim=1)
+            next_q1_values = self.q1_target_model(next_states_and_actions)
+            next_q2_values = self.q2_target_model(next_states_and_actions)
+            next_min_q_values = torch.min(next_q1_values, next_q2_values)
+            targets = rewards + self.gamma * (1 - dones) * (next_min_q_values - self.alpha * next_log_probs)
+            states_and_actions = torch.concatenate((states, torch.nn.functional.one_hot(actions.long(), num_classes=2)), dim=1)
+            q1_loss = torch.mean((self.q1_model(states_and_actions) - targets.detach()) ** 2)
+            q2_loss = torch.mean((self.q2_model(states_and_actions) - targets.detach()) ** 2)
+            self.update_model(q1_loss, self.q1_optimizer, self.q1_model, self.q1_target_model)
+            self.update_model(q2_loss, self.q2_optimizer, self.q2_model, self.q2_target_model)
+
+            pred_actions, log_probs = self.predict_actions(states)
+            states_and_pred_actions = torch.concatenate((states, pred_actions), dim=1)
+            q1_values = self.q1_model(states_and_pred_actions)
+            q2_values = self.q2_model(states_and_pred_actions)
+            min_q_values = torch.min(q1_values, q2_values)
+            pi_loss = - torch.mean(min_q_values - self.alpha * log_probs)
+            # print(pi_loss.detach().numpy())
+            self.update_model(pi_loss, self.pi_optimizer)
+
+    def update_model(self, loss, optimizer, model=None, target_model=None):
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        if model != None and target_model != None:
+            for param, terget_param in zip(model.parameters(), target_model.parameters()):
+                new_terget_param = (1 - self.tau) * terget_param + self.tau * param
+                terget_param.data.copy_(new_terget_param)
+
+    def fit(self):
+        for episode in range(self.n_episode):
+            total_reward = 0
+            state = self.env.reset()
+            for _ in range(self.max_len_trajectory):
+                action = self.get_action(state)
+                next_state, reward, done, _ = self.env.step(action)
+                total_reward += reward
+
+                self.policy_improvement(state, action, reward, done, next_state)
+                state = next_state
+
+                if done:
+                    break
+
+            if self.is_print:
+                print(f'iteration {episode} reward {np.round(total_reward, 3)}')
+                      #f'pi_loss {np.mean(self.mean_pi_losses[episode])} ')
+                      #f'v_loss {np.mean(self.mean_v_losses[episode * self.epoch_n:(episode + 1) * self.epoch_n])}')
+            self.mean_total_rewards.append(np.round(total_reward, 3))
+
+class AcrobotActionWrapper(gym.ActionWrapper):
+    """Change the action range (0, 2) to (-1, 1)."""
+    def action(self, action):
+        if action == 0:
+            return -1
+        elif action == 1:
+            return 0
+        elif action == 2:
+            return 1
+        return action
+
+if __name__ == '__main__':
+    sac = SAC_discrete(env=(gym.make('CartPole-v1')), n_episode=1000, max_len_trajectory=500)
+    sac.fit()
+    print(f'mean_total_rewards {sac.mean_total_rewards}')
+    print(f'mean_pi_losses{sac.mean_pi_losses}')
+    print(f'mean_v_losses{sac.mean_v_losses}')
